@@ -44,6 +44,8 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
+          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+
           # Pre-fetch rusty_v8 binary to avoid network access during build
           # Map Nix system to rusty_v8 target triple
           RUSTY_V8_ARCHIVE = let
