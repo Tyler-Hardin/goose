@@ -467,7 +467,12 @@ pub fn format_messages_with_options(
             if !pending_assistant_reasoning.is_empty() {
                 reasoning_text =
                     merge_reasoning_text(&pending_assistant_reasoning, &reasoning_text);
-                pending_assistant_reasoning.clear();
+                // Advance pending to the merged value so the NEXT assistant
+                // message (e.g. a tool-call chunk) receives the full reasoning,
+                // not a stale prefix.  We do NOT clear it here — clearing
+                // happens at the top of the loop on non-assistant messages
+                // (the true turn boundary).
+                pending_assistant_reasoning = reasoning_text.clone();
             }
 
             let has_tool_calls = converted
@@ -3455,23 +3460,17 @@ data: [DONE]"#;
     }
 
     #[test]
-    fn test_format_messages_carries_reasoning_through_text_only_chunks() -> anyhow::Result<()> {
-        // Scenario B from the streaming bug: thinking arrives first, then multiple
-        // text-only assistant messages, then a tool call with thinking re-attached
-        // by agent.rs (via the earlier-chunk lookback).
-        // Text-only messages set tool_call_turn_reasoning="" (line 453 else-branch),
-        // but the TC's own Thinking content must repopulate it.
+    fn test_format_messages_reasoning_survives_text_before_tool_call() -> anyhow::Result<()> {
         let messages = vec![
-            Message::assistant().with_content(MessageContent::thinking("reason", "")),
-            Message::assistant().with_text("partial answer"),
-            Message::assistant().with_text("more text"),
-            // agent.rs attaches the earlier thinking to the TC message
-            Message::assistant()
-                .with_content(MessageContent::thinking("reason", ""))
-                .with_tool_request(
-                    "tool1",
-                    Ok(CallToolRequestParams::new("test_tool").with_arguments(object!({}))),
-                ),
+            // Step 1: thinking-only chunk (streamed before text)
+            Message::assistant().with_content(MessageContent::thinking("reasoning", "")),
+            // Step 2: text content chunk (no tool_calls)
+            Message::assistant().with_text("I'll call a tool."),
+            // Step 3: tool-call chunk (no thinking — already yielded above)
+            Message::assistant().with_tool_request(
+                "tc1",
+                Ok(CallToolRequestParams::new("shell").with_arguments(object!({"command": "ls"}))),
+            ),
         ];
 
         let spec = format_messages_with_options(
@@ -3482,19 +3481,28 @@ data: [DONE]"#;
             },
         );
 
-        let tool_call_msgs: Vec<_> = spec
-            .iter()
-            .filter(|m| {
-                m.get("tool_calls")
-                    .and_then(|tc| tc.as_array())
-                    .is_some_and(|a| !a.is_empty())
-            })
-            .collect();
+        // Messages 2 (text) and 3 (tool_calls) are emitted separately
+        // because message 2 has content (text).
+        let text_msg = spec.iter().find(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| !s.is_empty())
+        });
+        let tool_msg = spec.iter().find(|m| m.get("tool_calls").is_some());
 
-        assert_eq!(tool_call_msgs.len(), 1);
+        assert!(text_msg.is_some(), "expected a text message");
+        assert!(tool_msg.is_some(), "expected a tool_calls message");
+
+        // Both messages should carry reasoning_content
         assert_eq!(
-            tool_call_msgs[0]["reasoning_content"], "reason",
-            "reasoning_content must survive text-only chunks between thinking and tool call"
+            text_msg.unwrap()["reasoning_content"],
+            "reasoning",
+            "text message must carry reasoning_content"
+        );
+        assert_eq!(
+            tool_msg.unwrap()["reasoning_content"],
+            "reasoning",
+            "tool_calls message must carry reasoning_content — DeepSeek rejects without it"
         );
 
         Ok(())
@@ -3628,6 +3636,104 @@ data: [DONE]"#;
         Ok(())
     }
 
+    #[test]
+    fn test_format_messages_merged_reasoning_carries_forward() -> anyhow::Result<()> {
+        let messages = vec![
+            // Chunk 1: thinking-only ("a")
+            Message::assistant().with_content(MessageContent::thinking("a", "")),
+            // Chunk 2: thinking + text ("b" + visible text)
+            Message::assistant()
+                .with_content(MessageContent::thinking("b", ""))
+                .with_text("I'll call a tool."),
+            // Chunk 3: tool-call only (no thinking)
+            Message::assistant().with_tool_request(
+                "tc1",
+                Ok(CallToolRequestParams::new("shell").with_arguments(object!({"command": "ls"}))),
+            ),
+        ];
+
+        let spec = format_messages_with_options(
+            &messages,
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+            },
+        );
+
+        let text_msg = spec.iter().find(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| !s.is_empty())
+        });
+        let tool_msg = spec.iter().find(|m| m.get("tool_calls").is_some());
+
+        assert!(text_msg.is_some(), "expected a text message");
+        assert!(tool_msg.is_some(), "expected a tool_calls message");
+
+        // Text message should have merged reasoning "ab"
+        assert_eq!(
+            text_msg.unwrap()["reasoning_content"],
+            "ab",
+            "text message must carry merged reasoning_content"
+        );
+        // Tool-call message must also carry the FULL merged reasoning "ab",
+        // not just the stale prefix "a".
+        assert_eq!(
+            tool_msg.unwrap()["reasoning_content"],
+            "ab",
+            "tool_calls message must carry full merged reasoning_content, not stale prefix"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_messages_reasoning_cleared_across_user_message_boundary() -> anyhow::Result<()> {
+        let messages = vec![
+            // Turn 1: assistant with thinking + tool call
+            Message::assistant().with_content(MessageContent::thinking("turn-1 thinking", "")),
+            Message::assistant().with_tool_request(
+                "tc1",
+                Ok(CallToolRequestParams::new("read").with_arguments(object!({"path": "/tmp"}))),
+            ),
+            // Tool response (user role)
+            Message::user().with_tool_response(
+                "tc1",
+                Ok(rmcp::model::CallToolResult::success(vec![
+                    RawContent::text("file contents").no_annotation(),
+                ])),
+            ),
+            // Turn 2: assistant with thinking + tool call (fresh reasoning)
+            Message::assistant().with_content(MessageContent::thinking("turn-2 thinking", "")),
+            Message::assistant().with_tool_request(
+                "tc2",
+                Ok(CallToolRequestParams::new("write")
+                    .with_arguments(object!({"path": "/tmp/out", "content": "done"}))),
+            ),
+        ];
+
+        let spec = format_messages_with_options(
+            &messages,
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                preserve_thinking_context: true,
+            },
+        );
+
+        // Find tool_calls messages — one per turn
+        let tool_msgs: Vec<_> = spec
+            .iter()
+            .filter(|m| m.get("tool_calls").is_some())
+            .collect();
+        assert_eq!(tool_msgs.len(), 2, "expected two tool_calls messages");
+
+        // Turn 1 tool_calls should have turn-1 reasoning only
+        assert_eq!(tool_msgs[0]["reasoning_content"], "turn-1 thinking");
+        // Turn 2 tool_calls should have turn-2 reasoning only (not stale turn-1)
+        assert_eq!(tool_msgs[1]["reasoning_content"], "turn-2 thinking");
+
+        Ok(())
+    }
     #[test_case(
         "data: {\"error\":{\"message\":\"Internal server error\",\"type\":\"server_error\",\"code\":500}}\ndata: [DONE]",
         "Internal server error";

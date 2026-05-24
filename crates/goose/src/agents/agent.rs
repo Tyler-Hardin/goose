@@ -2075,6 +2075,16 @@ impl Agent {
                 // reasoning without hiding final-only non-streaming thoughts.
                 let mut surfaced_thinking_in_turn = false;
 
+                // Accumulate thinking content across all streamed messages in this
+                // turn. When DeepSeek (and similar providers) stream a response with
+                // tool calls, the thinking arrives in intermediate chunks BEFORE the
+                // tool-call chunk. The intermediate messages are stored separately,
+                // but the tool-request message must ALSO carry the thinking content
+                // so that format_messages_with_options can set reasoning_content on
+                // it. Without this, providers that require reasoning_content on ALL
+                // assistant messages with tool_calls return a 400 error.
+                let mut turn_thinking_content: Vec<MessageContent> = Vec::new();
+
                 while let Some(next) = stream.next().await {
                     if is_token_cancelled(&cancel_token) || exit_chat {
                         break;
@@ -2163,6 +2173,13 @@ impl Agent {
                                     let text = filtered_response.as_concat_text();
                                     if !text.is_empty() {
                                         last_assistant_text.push_str(&text);
+                                    }
+                                    // Accumulate thinking content from intermediate streamed
+                                    // messages so it can be attached to later tool-request messages.
+                                    for content in &response.content {
+                                        if matches!(content, MessageContent::Thinking(_)) {
+                                            turn_thinking_content.push(content.clone());
+                                        }
                                     }
                                     messages_to_add.push(response);
                                     continue;
@@ -2342,123 +2359,55 @@ impl Agent {
                                     }
                                 }
 
-                                // Thinking/reasoning belongs on the tool-call messages, not also
-                                // as a separate standalone message: Gemini and Kimi/DeepSeek
-                                // require it echoed on each assistant tool-call message, and the
-                                // provider formatters reconstruct per-provider shape from there.
-                                // Storing it both standalone AND on the tool-call message
-                                // duplicates it; once merge_consecutive_messages glues the adjacent
-                                // standalone and tool-call messages together, the duplicate signed
-                                // blocks make Anthropic reject the turn with a 400. So the thinking
-                                // is carried onto the split request messages below and never kept
-                                // as a redundant standalone message.
-                                let direct_thinking: Vec<MessageContent> = response
-                                    .content
-                                    .iter()
-                                    .filter(|c| {
-                                        matches!(
-                                            c,
-                                            MessageContent::Thinking(_)
-                                                | MessageContent::RedactedThinking(_)
-                                        )
-                                    })
+                                // Preserve thinking/reasoning content from the original response.
+                                // Gemini (and other thinking models) require thinking to be echoed back.
+                                // Kimi/DeepSeek require reasoning_content on assistant tool call messages.
+                                //
+                                // When DeepSeek streams a response with tool calls, the thinking
+                                // arrives in intermediate chunks BEFORE the tool-call chunk. Those
+                                // intermediate messages are already pushed to messages_to_add above,
+                                // but the tool-request message must ALSO carry the thinking so that
+                                // format_messages_with_options can set reasoning_content on it.
+                                // Use turn_thinking_content (accumulated from intermediate messages)
+                                // as a fallback when the current response has no thinking of its own.
+                                // Preserve thinking content from the response (if any).
+                                // Do NOT fall back to turn_thinking_content here — those
+                                // intermediate Thinking messages were already pushed to
+                                // messages_to_add by the num_tool_requests == 0 path above.
+                                let thinking_content: Vec<MessageContent> = response.content.iter()
+                                    .filter(|c| matches!(c, MessageContent::Thinking(_)))
                                     .cloned()
                                     .collect();
-                                // When thinking arrived in earlier stream chunks it was stored as
-                                // standalone thinking-only messages; reuse that thinking on the
-                                // tool-call messages and drop the standalone messages so the
-                                // thinking isn't duplicated.
-                                // Always accumulate ALL prior thinking — even when
-                                // direct_thinking is non-empty (reasoning arrived on the same
-                                // chunk as tool_calls) — because otherwise only the last chunk's
-                                // reasoning ends up on split tool-call messages.
-                                // Also extract thinking from mixed (thinking+text) messages,
-                                // not just pure-thinking-only ones.
-                                let mut accumulated_prior: Vec<MessageContent> = Vec::new();
-                                let mut indices_to_remove: Vec<usize> = Vec::new();
-                                for (idx, m) in messages_to_add.messages_mut().iter_mut().enumerate()
-                                {
-                                    if m.role != response.role || m.content.is_empty() {
-                                        continue;
-                                    }
-                                    let thinking_only = m.content.iter().all(|c| {
-                                        matches!(
-                                            c,
-                                            MessageContent::Thinking(_)
-                                                | MessageContent::RedactedThinking(_)
-                                        )
-                                    });
-                                    let has_thinking = m.content.iter().any(|c| {
-                                        matches!(
-                                            c,
-                                            MessageContent::Thinking(_)
-                                                | MessageContent::RedactedThinking(_)
-                                        )
-                                    });
-                                    if has_thinking {
-                                        // Only accumulate thinking from messages that
-                                        // have not already been split into tool-call
-                                        // request_msg items — prior-split messages
-                                        // already carry their own thinking copy.
-                                        if !m.content.iter().any(|c| {
-                                            matches!(c, MessageContent::ToolRequest(_))
-                                        }) {
-                                            for c in &m.content {
-                                                if matches!(
-                                                    c,
-                                                    MessageContent::Thinking(_)
-                                                        | MessageContent::RedactedThinking(_)
-                                                ) {
-                                                    accumulated_prior.push(c.clone());
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if thinking_only {
-                                        indices_to_remove.push(idx);
-                                    } else if has_thinking
-                                        && !m.content.iter().any(|c| {
-                                            matches!(c, MessageContent::ToolRequest(_))
-                                        })
-                                    {
-                                        // Strip thinking blocks from mixed text+thinking
-                                        // messages so the same signed/unsigned thinking is not
-                                        // duplicated when carried onto the tool-call request
-                                        // messages below. Messages that already contain tool
-                                        // requests are prior-split request_msg items whose
-                                        // thinking was already attached — stripping their
-                                        // thinking would leave only the last split message
-                                        // with reasoning, violating the signed-thinking
-                                        // dedup expectation that the first split message
-                                        // retains it.
-                                        m.content.retain(|c| {
-                                            !matches!(
-                                                c,
-                                                MessageContent::Thinking(_)
-                                                    | MessageContent::RedactedThinking(_)
-                                            )
-                                        });
-                                    }
+                                if !thinking_content.is_empty() {
+                                    let thinking_msg = Message::new(
+                                        response.role.clone(),
+                                        response.created,
+                                        thinking_content.clone(),
+                                    )
+                                    .with_id(format!("msg_{}", Uuid::new_v4()));
+                                    messages_to_add.push(thinking_msg);
                                 }
-                                // Remove in reverse order to preserve indices
-                                for idx in indices_to_remove.into_iter().rev() {
-                                    messages_to_add.remove(idx);
-                                }
-                                let response_thinking = if direct_thinking.is_empty() {
-                                    accumulated_prior
-                                } else if accumulated_prior.is_empty() {
-                                    direct_thinking
-                                } else {
-                                    let mut merged = accumulated_prior;
-                                    merged.extend(direct_thinking);
-                                    merged
+
+                                // Collect reasoning content to attach to tool request messages.
+                                // Prefer thinking from the current response; fall back to the
+                                // accumulated turn_thinking_content from earlier intermediate chunks.
+                                let reasoning_content: Vec<MessageContent> = {
+                                    let from_response: Vec<MessageContent> = response.content.iter()
+                                        .filter(|c| matches!(c, MessageContent::Thinking(_)))
+                                        .cloned()
+                                        .collect();
+                                    if from_response.is_empty() && !turn_thinking_content.is_empty() {
+                                        turn_thinking_content.clone()
+                                    } else {
+                                        from_response
+                                    }
                                 };
 
                                 for request in frontend_requests.iter().chain(remaining_requests.iter()) {
                                     let mut request_msg = Message::assistant()
                                         .with_id(format!("msg_{}", Uuid::new_v4()));
 
-                                    for thinking in &response_thinking {
+                                    for thinking in &reasoning_content {
                                         request_msg = request_msg.with_content(thinking.clone());
                                     }
 
