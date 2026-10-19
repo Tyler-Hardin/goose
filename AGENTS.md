@@ -2,6 +2,31 @@
 
 goose is an AI agent framework in Rust with CLI and Electron desktop interfaces.
 
+## Personal Fork
+
+This clone is Tyler Hardin's personal fork, not the upstream repository.
+
+- `origin` is `github.com/Tyler-Hardin/goose`; `upstream` is `github.com/aaif-goose/goose`. The default branch is `main`, not `master`.
+- Fork-only changes live as a minimal stack of commits directly on `main`, on top of `upstream/main`. Do not open pull requests from this clone; upstream contributions follow the Contribution Workflow below from a branch based on `upstream/main`.
+- Keep the fork delta as small as possible. At the time of writing it is only `doCheck = false` in `flake.nix` (the Nix package build does not run tests) plus a refreshed `flake.lock`. Run `git diff upstream/main..main` to see the current delta.
+- This section is fork-only. Preserve it when resolving rebase conflicts in `AGENTS.md`.
+
+### Rebasing onto upstream
+
+1. `git fetch upstream`
+2. Save the current tip: `git branch backup/pre-rebase-$(date +%Y%m%d-%H%M%S)`
+3. `git rebase upstream/main`
+4. Resolve conflicts. They usually land in `flake.nix` and `flake.lock`. Keep the fork's `doCheck = false`; drop hunks that upstream has made obsolete instead of resurrecting them (for example, the old `RUSTY_V8_ARCHIVE` prefetch was removed upstream when the v8 dependency went away).
+5. Review `git diff upstream/main..main` and confirm every remaining hunk is still necessary.
+6. Refresh flake inputs with `nix flake update`, then fold the lock change into the existing fork flake commit with `git reset --soft HEAD~1` / `git commit --amend`. Do not add a separate `flake.lock: Update` commit.
+7. Validate the flake before pushing:
+   - `nix eval .#packages.x86_64-linux.default.drvPath`
+   - `nix build .#packages.x86_64-linux.default`
+   Upstream changes to `Cargo.toml` can break the flake, e.g. a new git dependency needs a `cargoLock.outputHashes` entry. A build that reaches compiling `goose-cli` has resolved dependencies successfully.
+8. Report the resulting diff to the user and force push only after confirmation: `git push --force-with-lease origin main`.
+
+The `dsv4` remote points at a repository that no longer exists; ignore it.
+
 ## Contribution Workflow
 
 The issue is the source of truth for work intended for an upstream pull request. Track issue status on the [Goose Issues board](https://github.com/orgs/aaif-goose/projects/1).
